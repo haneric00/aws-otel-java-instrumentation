@@ -1,0 +1,85 @@
+## TEMPORARY — DELETE BEFORE PR.
+## Validates the lambda-layer upstream-dependency caching on native amd64 GitHub
+## runners, with NO AWS access. Mirrors the real application-signals-lambda-layer-build
+## job's cache/build steps but omits the AWS credential + S3 upload steps.
+##
+## HOW TO USE:
+##   1. Actions tab -> "Test Lambda Cache" -> Run workflow (on this branch).
+##      Run 1 = cache MISS: builds upstream deps, saves cache, builds layer.
+##   2. Re-run it once more.
+##      Run 2 = cache HIT: "Build patched upstream dependencies" step should show
+##      SKIPPED, and the layer build should still succeed from restored ~/.m2.
+##   3. When done: delete this file, and delete the `test-...` cache entry
+##      (Actions -> Caches, or `gh cache delete`), so nothing lingers.
+##
+## The cache key is deliberately prefixed with `test-` so it can NEVER collide
+## with the real main-build lambda cache namespace.
+name: Test Lambda Cache
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-lambda-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 #v5.0.0
+        with:
+          java-version-file: .java-version
+          distribution: 'temurin'
+
+      - name: Restore patched upstream Maven artifacts
+        id: cache-upstream
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 #v4.2.4
+        with:
+          path: ~/.m2/repository/io/opentelemetry/
+          # `test-` prefix isolates this from the real main-build cache namespace.
+          key: test-${{ runner.os }}-lambda-upstream-${{ hashFiles('.github/patches/versions', '.github/patches/opentelemetry-java-contrib.patch', 'lambda-layer/patches/opentelemetry-java-instrumentation.patch') }}
+
+      - name: Report cache status
+        run: |
+          echo "cache-hit = '${{ steps.cache-upstream.outputs.cache-hit }}'"
+          if [ "${{ steps.cache-upstream.outputs.cache-hit }}" = "true" ]; then
+            echo "HIT: upstream build should be SKIPPED below; layer must still build from restored ~/.m2."
+          else
+            echo "MISS: upstream will build and be saved."
+          fi
+
+      - name: Build patched upstream dependencies
+        if: steps.cache-upstream.outputs.cache-hit != 'true'
+        working-directory: lambda-layer
+        run: |
+          ./build-upstream-deps.sh
+
+      - name: Save patched upstream Maven artifacts
+        if: steps.cache-upstream.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 #v4.2.4
+        with:
+          path: ~/.m2/repository/io/opentelemetry/
+          key: ${{ steps.cache-upstream.outputs.cache-primary-key }}
+
+      # This ALWAYS runs. On a cache hit it proves build-layer.sh resolves the
+      # upstream deps purely from the restored ~/.m2 (the core thing under test).
+      - name: Build Application Signals Lambda Layer
+        working-directory: lambda-layer
+        run: |
+          ./build-layer.sh
+
+      - name: Verify layer artifact was produced
+        run: |
+          ls -la lambda-layer/build/distributions/aws-opentelemetry-java-layer.zip
+          echo "--- layer contents ---"
+          unzip -l lambda-layer/build/distributions/aws-opentelemetry-java-layer.zip
+
+      - name: Upload layer zip
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 #v4.6.2
+        with:
+          name: test-aws-opentelemetry-java-layer.zip
+          path: lambda-layer/build/distributions/aws-opentelemetry-java-layer.zip
